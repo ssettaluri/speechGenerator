@@ -17,6 +17,16 @@ from typing import Optional
 
 import anthropic
 
+from console import (
+    print_corpus_cap_reached, print_corpus_query, print_exit,
+    print_guardrails_block, print_guardrails_pass, print_iteration,
+    print_report, print_speech, spinner,
+)
+from logger import (
+    log_corpus_cap, log_corpus_query, log_exit, log_guardrails_block,
+    log_guardrails_pass, log_iteration, log_output_block,
+    log_run_complete, log_run_start,
+)
 from guardrails import GuardrailsRequest, run_guardrails
 from observability import ObservabilityReport, build_report
 from output import FinalOutput, finalize_output
@@ -28,6 +38,8 @@ from telemetry import (
     iteration_histogram,
     latency_histogram,
     run_counter,
+    set_run_id,
+    stamp_span,
     token_counter,
     tracer,
 )
@@ -37,6 +49,7 @@ from telemetry import (
 # ---------------------------------------------------------------------------
 
 MAX_ITERATIONS = 3
+MAX_CORPUS_QUERIES_PER_ITER = 3   # prevent the LLM over-querying the corpus
 CONFIDENCE_THRESHOLD = 0.80
 MODEL = "claude-sonnet-4-6"
 
@@ -156,9 +169,10 @@ def _build_system_prompt(alignment: str) -> str:
         f"Your task is to write speeches that reflect a {alignment} political perspective. "
         f"Be factual, persuasive, and appropriate for a public audience. "
         f"Never produce hate speech, incitement, or content that violates ethical guidelines.\n\n"
-        f"You have access to a policy corpus tool. Use it to search for historical speeches "
-        f"on the topic before you start writing — they will help you match the right tone and style. "
-        f"After gathering references, write the complete speech text and nothing else."
+        f"You have access to a policy corpus tool. Search it at most {MAX_CORPUS_QUERIES_PER_ITER} times "
+        f"before writing — use it for style inspiration only. "
+        f"IMPORTANT: You must hit the target word count exactly. Count your words carefully. "
+        f"Output only the speech text — no headings, no commentary, no word count label."
     )
 
 
@@ -171,13 +185,17 @@ def _build_user_prompt(
     if iteration == 1 or previous_speech is None:
         return (
             f"Write a political speech about: {topic}\n"
-            f"Target length: approximately {desired_length_words} words.\n"
-            f"Search the policy corpus first, then write only the speech text."
+            f"Target length: EXACTLY {desired_length_words} words (±10%). "
+            f"Do not exceed {int(desired_length_words * 1.1)} words under any circumstances.\n"
+            f"Search the policy corpus first (max {MAX_CORPUS_QUERIES_PER_ITER} queries), "
+            f"then write only the speech text."
         )
+    current_words = len(previous_speech.split())
     return (
-        f"Revise and improve the following speech about '{topic}'. "
-        f"Make it more compelling, coherent, and closer to {desired_length_words} words. "
-        f"You may search the corpus again if helpful.\n\n"
+        f"Revise this speech about '{topic}'. "
+        f"Current word count: {current_words}. Target: {desired_length_words} words (±10%). "
+        f"{'SHORTEN it significantly.' if current_words > desired_length_words * 1.1 else 'EXPAND it.'} "
+        f"You may search the corpus once more if helpful.\n\n"
         f"Previous draft:\n{previous_speech}\n\n"
         f"Return only the revised speech text."
     )
@@ -200,6 +218,7 @@ def _run_one_iteration(
     system_prompt: str,
     user_prompt: str,
     iteration: int,
+    run_id: str = "",
 ) -> tuple[str, dict, float, list[dict], list[int]]:
     """
     Send a message to the LLM, handle any tool-use turns,
@@ -213,11 +232,18 @@ def _run_one_iteration(
     t0 = time.perf_counter()
 
     while True:
+        # Stop offering the tool once the per-iteration cap is reached
+        at_cap = len(tool_calls_log) >= MAX_CORPUS_QUERIES_PER_ITER
+        if at_cap and tool_calls_log:
+            print_corpus_cap_reached(MAX_CORPUS_QUERIES_PER_ITER)
+            log_corpus_cap(run_id, iteration, MAX_CORPUS_QUERIES_PER_ITER)
+        tools = [] if at_cap else [CORPUS_TOOL]
+
         response = client.messages.create(
             model=MODEL,
             max_tokens=4096,
             system=system_prompt,
-            tools=[CORPUS_TOOL],
+            tools=tools,
             messages=messages,
         )
 
@@ -226,7 +252,6 @@ def _run_one_iteration(
 
         # ── Tool use: let the LLM query the corpus ──────────────────────────
         if response.stop_reason == "tool_use":
-            # Append the assistant turn
             messages.append({"role": "assistant", "content": response.content})
 
             tool_results = []
@@ -235,12 +260,9 @@ def _run_one_iteration(
                     continue
 
                 tool_input = block.input
-                print(
-                    f"  [tool] search_policy_corpus("
-                    + ", ".join(f"{k}={v!r}" for k, v in tool_input.items())
-                    + ")"
-                )
                 result_text, corpus_ids = _execute_corpus_tool(tool_input)
+                print_corpus_query(tool_input, len(corpus_ids))
+                log_corpus_query(run_id, iteration, tool_input, len(corpus_ids))
                 all_corpus_ids.extend(corpus_ids)
 
                 tool_calls_log.append({"tool": block.name, "input": tool_input, "result_ids": corpus_ids})
@@ -271,12 +293,14 @@ def run_agent_loop(request: LoopRequest) -> LoopResult:
     run_id = str(uuid.uuid4())[:8]
     labels = {"alignment": request.alignment}
 
+    set_run_id(run_id)   # propagates to all child spans via ContextVar
+    log_run_start(run_id, request.alignment, request.topic, request.desired_length_words)
     with tracer.start_as_current_span("harness.run") as root_span:
-      root_span.set_attribute("run.id", run_id)
-      root_span.set_attribute("run.alignment", request.alignment)
-      root_span.set_attribute("run.topic", request.topic)
-      root_span.set_attribute("run.desired_length_words", request.desired_length_words)
-      return _run_agent_loop_inner(request, run_id, labels)
+        stamp_span(root_span,
+                   **{"run.alignment": request.alignment,
+                      "run.topic": request.topic,
+                      "run.desired_length_words": request.desired_length_words})
+        return _run_agent_loop_inner(request, run_id, labels)
 
 
 def _run_agent_loop_inner(request: LoopRequest, run_id: str, labels: dict) -> LoopResult:
@@ -287,6 +311,8 @@ def _run_agent_loop_inner(request: LoopRequest, run_id: str, labels: dict) -> Lo
         desired_length_words=request.desired_length_words,
     ))
     if not outcome.passed:
+        print_guardrails_block(outcome.triggered_rule or "unknown", outcome.reason or "")
+        log_guardrails_block(run_id, outcome.triggered_rule or "unknown", outcome.reason or "")
         run_counter.add(1, {**labels, "result": "blocked"})
         blocked_counter.add(1, {**labels, "rule": outcome.triggered_rule or "unknown"})
         report = build_report(
@@ -308,6 +334,9 @@ def _run_agent_loop_inner(request: LoopRequest, run_id: str, labels: dict) -> Lo
             success=False, speech="", iterations_used=0, confidence=0.0,
             blocked_reason=outcome.reason, report=report,
         )
+
+    print_guardrails_pass()
+    log_guardrails_pass(run_id)
 
     # ── Step 4: Ensure corpus DB is ready ───────────────────────────────────
     init_db()
@@ -331,7 +360,7 @@ def _run_agent_loop_inner(request: LoopRequest, run_id: str, labels: dict) -> Lo
             iter_span.set_attribute("iteration.number", iteration)
 
             speech, token_usage, latency_ms, tool_calls, corpus_ids = _run_one_iteration(
-                client, system_prompt, user_prompt, iteration
+                client, system_prompt, user_prompt, iteration, run_id
             )
             all_corpus_ids.extend(corpus_ids)
             confidence = _estimate_confidence(speech, request.desired_length_words)
@@ -357,23 +386,41 @@ def _run_agent_loop_inner(request: LoopRequest, run_id: str, labels: dict) -> Lo
                 tool_calls=tool_calls,
             ))
 
-            print(
-                f"[iter {iteration}/{MAX_ITERATIONS}] "
-                f"words={len(speech.split())} "
-                f"confidence={confidence:.2f} "
-                f"corpus_queries={len(tool_calls)} "
-                f"tokens=({token_usage['input']}in/{token_usage['output']}out) "
-                f"latency={latency_ms:.0f}ms"
+            print_iteration(
+                iteration=iteration,
+                max_iter=MAX_ITERATIONS,
+                word_count=len(speech.split()),
+                desired=request.desired_length_words,
+                confidence=confidence,
+                threshold=CONFIDENCE_THRESHOLD,
+                corpus_queries=len(tool_calls),
+                input_tokens=token_usage["input"],
+                output_tokens=token_usage["output"],
+                latency_ms=latency_ms,
+            )
+            log_iteration(
+                run_id=run_id,
+                iteration=iteration,
+                max_iter=MAX_ITERATIONS,
+                word_count=len(speech.split()),
+                desired=request.desired_length_words,
+                confidence=confidence,
+                corpus_queries=len(tool_calls),
+                input_tokens=token_usage["input"],
+                output_tokens=token_usage["output"],
+                latency_ms=latency_ms,
             )
 
             # ── Step 6: Exit condition ──────────────────────────────────────
             word_count = len(speech.split())
             length_met = abs(word_count - request.desired_length_words) / request.desired_length_words < 0.10
             if length_met and confidence >= CONFIDENCE_THRESHOLD:
-                print(f"[loop] Exit: confidence {confidence:.2f} >= {CONFIDENCE_THRESHOLD} and length met.")
+                print_exit("confidence_met")
+                log_exit(run_id, "confidence_met")
                 break
     else:
-        print(f"[loop] Exit: max iterations ({MAX_ITERATIONS}) reached.")
+        print_exit("iterations_exhausted")
+        log_exit(run_id, "iterations_exhausted")
 
     deduped_corpus_ids = list(dict.fromkeys(all_corpus_ids))
 
@@ -393,7 +440,7 @@ def _run_agent_loop_inner(request: LoopRequest, run_id: str, labels: dict) -> Lo
     )
 
     if not final.validation_passed:
-        print(f"[output] Post-generation block: {final.blocked_reason}")
+        log_output_block(run_id, final.blocked_reason or "")
 
     # ── Step 8: Observability report ─────────────────────────────────────────
     report = build_report(
@@ -435,14 +482,20 @@ if __name__ == "__main__":
         desired_length_words=300,
     ))
 
-    if not result.success:
-        print(f"\nBLOCKED: {result.blocked_reason}")
-    else:
-        print(f"\n{'='*60}")
-        print(f"FINAL SPEECH  ({result.output.word_count} words)")
-        print("=" * 60)
-        print(result.speech)
+    if result.success:
+        print_speech(result.speech, result.output.word_count, result.output.truncated)
 
     if result.report:
-        print()
-        result.report.print_summary()
+        print_report(result.report)
+        log_run_complete(
+            run_id=result.report.run_id,
+            success=result.success,
+            word_count=result.output.word_count if result.output else 0,
+            confidence=result.confidence,
+            truncated=result.output.truncated if result.output else False,
+            iterations_used=result.report.iterations_used,
+            total_tokens=result.report.total_tokens,
+            total_latency_ms=result.report.total_latency_ms,
+            corpus_ids=result.report.unique_corpus_ids,
+            speech_preview=result.speech,
+        )

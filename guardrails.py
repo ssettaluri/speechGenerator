@@ -43,6 +43,8 @@ BANNED_TOPICS = [
     "csam",
     "mass casualty",
     "ethnic cleansing",
+    "jews",
+    "islam"
 ]
 
 SYSTEM_PROMPT_INJECTION_PATTERNS = [
@@ -147,6 +149,7 @@ class GuardrailsRequest:
     alignment: str
     topic: str
     desired_length_words: int
+    output_text: Optional[str] = None   # set by finalize_output for post-generation checks
 
 
 def run_guardrails(request: GuardrailsRequest) -> FilterOutcome:
@@ -154,22 +157,35 @@ def run_guardrails(request: GuardrailsRequest) -> FilterOutcome:
     Run all guardrail checks against the incoming request.
     Returns the first blocking outcome, or PASS if all checks clear.
     """
-    from telemetry import tracer
+    from telemetry import tracer, stamp_span
     with tracer.start_as_current_span("guardrails.check") as span:
-        span.set_attribute("guardrails.alignment", request.alignment)
-        span.set_attribute("guardrails.topic", request.topic[:100])
-        span.set_attribute("guardrails.desired_length_words", request.desired_length_words)
+        is_post_generation = request.output_text is not None
+        stamp_span(span,
+                   **{"guardrails.alignment": request.alignment,
+                      "guardrails.topic": request.topic[:100],
+                      "guardrails.desired_length_words": request.desired_length_words,
+                      "guardrails.post_generation": is_post_generation})
 
-        combined_text = f"{request.alignment} {request.topic}"
+        input_text = f"{request.alignment} {request.topic}"
 
-        checks = [
-            _check_alignment(request.alignment),
-            _check_length_param(request.desired_length_words),
-            _check_topic_length(request.topic),
-            _check_hate_speech(combined_text),
-            _check_banned_topics(combined_text),
-            _check_prompt_injection(combined_text),
-        ]
+        # Pre-generation: check input fields (alignment, length, topic length, input content)
+        # Post-generation: skip topic-length/input checks; scan the generated text instead
+        if not is_post_generation:
+            checks = [
+                _check_alignment(request.alignment),
+                _check_length_param(request.desired_length_words),
+                _check_topic_length(request.topic),
+                _check_hate_speech(input_text),
+                _check_banned_topics(input_text),
+                _check_prompt_injection(input_text),
+            ]
+        else:
+            content_text = request.output_text
+            checks = [
+                _check_hate_speech(content_text),
+                _check_banned_topics(content_text),
+                _check_prompt_injection(content_text),
+            ]
 
         for outcome in checks:
             if not outcome.passed:

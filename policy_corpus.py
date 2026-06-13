@@ -130,12 +130,13 @@ def query_speeches(
     sql = f"SELECT * FROM speeches {where} ORDER BY id DESC LIMIT ?"
     params.append(limit)
 
-    from telemetry import tracer
+    from telemetry import tracer, stamp_span
     with tracer.start_as_current_span("corpus.query") as span:
-        span.set_attribute("corpus.topic", topic or "")
-        span.set_attribute("corpus.alignment", alignment or "")
-        span.set_attribute("corpus.sentiment", sentiment or "")
-        span.set_attribute("corpus.limit", limit)
+        stamp_span(span,
+                   **{"corpus.topic": topic or "",
+                      "corpus.alignment": alignment or "",
+                      "corpus.sentiment": sentiment or "",
+                      "corpus.limit": limit})
         with _conn() as con:
             rows = con.execute(sql, params).fetchall()
         results = [_row_to_speech(r) for r in rows]

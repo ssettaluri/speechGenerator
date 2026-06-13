@@ -10,6 +10,7 @@ Endpoints:
 
 import os
 from contextlib import asynccontextmanager
+from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
 
 from fastapi import FastAPI, HTTPException
@@ -19,6 +20,8 @@ from pydantic import BaseModel, Field, field_validator
 
 import telemetry  # initialises provider on import
 from agent_loop import LoopRequest, run_agent_loop
+
+_executor = ThreadPoolExecutor(max_workers=4)
 
 
 @asynccontextmanager
@@ -132,7 +135,7 @@ def alignments():
 
 
 @app.post("/generate", response_model=GenerateResponse, tags=["Speech"])
-def generate(body: GenerateRequest):
+async def generate(body: GenerateRequest):
     """
     Run the full harness pipeline and return the generated speech plus
     an observability report for the run.
@@ -140,11 +143,16 @@ def generate(body: GenerateRequest):
     if not os.environ.get("ANTHROPIC_API_KEY"):
         raise HTTPException(status_code=500, detail="ANTHROPIC_API_KEY is not set on the server.")
 
-    result = run_agent_loop(LoopRequest(
-        alignment=body.alignment,
-        topic=body.topic,
-        desired_length_words=body.desired_length_words,
-    ))
+    import asyncio
+    loop = asyncio.get_event_loop()
+    result = await loop.run_in_executor(
+        _executor,
+        lambda: run_agent_loop(LoopRequest(
+            alignment=body.alignment,
+            topic=body.topic,
+            desired_length_words=body.desired_length_words,
+        ))
+    )
 
     report = result.report
     obs = ObservabilityOut(

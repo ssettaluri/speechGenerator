@@ -11,6 +11,7 @@ Environment variables:
 """
 
 import os
+from contextvars import ContextVar
 
 from opentelemetry import metrics, trace
 from opentelemetry.exporter.otlp.proto.grpc.metric_exporter import OTLPMetricExporter
@@ -105,6 +106,28 @@ confidence_histogram = meter.create_histogram(
     "speech.confidence",
     description="Final confidence score distribution",
 )
+
+
+# ---------------------------------------------------------------------------
+# Run-scoped context  — set once per run, read by any child span
+# ---------------------------------------------------------------------------
+
+_current_run_id: ContextVar[str] = ContextVar("run_id", default="")
+
+def set_run_id(run_id: str):
+    """Call at the start of each run. All spans created in this context inherit it."""
+    _current_run_id.set(run_id)
+
+def get_run_id() -> str:
+    return _current_run_id.get()
+
+def stamp_span(span, **extra):
+    """Stamp the active span with run_id + any extra attributes."""
+    run_id = get_run_id()
+    if run_id:
+        span.set_attribute("run.id", run_id)
+    for k, v in extra.items():
+        span.set_attribute(k, v)
 
 
 # ---------------------------------------------------------------------------

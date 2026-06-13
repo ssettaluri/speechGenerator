@@ -81,10 +81,11 @@ def finalize_output(
     Step 7 pipeline:
       strip artefacts → hard length cap → post-generation guardrails check.
     """
-    from telemetry import tracer
+    from telemetry import tracer, stamp_span
     with tracer.start_as_current_span("output.finalize") as span:
-        span.set_attribute("output.input_word_count", len(speech.split()))
-        span.set_attribute("output.desired_length_words", desired_length_words)
+        stamp_span(span,
+                   **{"output.input_word_count": len(speech.split()),
+                      "output.desired_length_words": desired_length_words})
 
         # 1. Strip LLM/tool artefacts
         clean = _strip_artefacts(speech)
@@ -94,13 +95,15 @@ def finalize_output(
         span.set_attribute("output.truncated", truncated)
         span.set_attribute("output.final_word_count", len(capped.split()))
 
-        # 3. Post-generation guardrails on the *output* text
-        #    Reuse the same filter layer with the output text as the topic field
-        #    so hate-speech / banned-topic checks run over what was actually generated.
+        # 3. Post-generation guardrails on the *output* text.
+        #    Pass the original topic (not the speech) to avoid tripping the
+        #    topic-length check. Hate speech / banned-topic patterns are checked
+        #    against the generated speech via combined_text inside run_guardrails.
         outcome = run_guardrails(GuardrailsRequest(
             alignment=alignment,
-            topic=capped,               # check the generated content, not just the input topic
+            topic=topic,                # original short topic, not the full speech
             desired_length_words=desired_length_words,
+            output_text=capped,         # speech checked separately for content rules
         ))
 
         if not outcome.passed:
