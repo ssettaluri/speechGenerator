@@ -81,36 +81,46 @@ def finalize_output(
     Step 7 pipeline:
       strip artefacts → hard length cap → post-generation guardrails check.
     """
-    # 1. Strip LLM/tool artefacts
-    clean = _strip_artefacts(speech)
+    from telemetry import tracer
+    with tracer.start_as_current_span("output.finalize") as span:
+        span.set_attribute("output.input_word_count", len(speech.split()))
+        span.set_attribute("output.desired_length_words", desired_length_words)
 
-    # 2. Hard length cap at sentence boundary
-    capped, truncated = _truncate_to_words(clean, desired_length_words)
+        # 1. Strip LLM/tool artefacts
+        clean = _strip_artefacts(speech)
 
-    # 3. Post-generation guardrails on the *output* text
-    #    Reuse the same filter layer with the output text as the topic field
-    #    so hate-speech / banned-topic checks run over what was actually generated.
-    outcome = run_guardrails(GuardrailsRequest(
-        alignment=alignment,
-        topic=capped,               # check the generated content, not just the input topic
-        desired_length_words=desired_length_words,
-    ))
+        # 2. Hard length cap at sentence boundary
+        capped, truncated = _truncate_to_words(clean, desired_length_words)
+        span.set_attribute("output.truncated", truncated)
+        span.set_attribute("output.final_word_count", len(capped.split()))
 
-    if not outcome.passed:
+        # 3. Post-generation guardrails on the *output* text
+        #    Reuse the same filter layer with the output text as the topic field
+        #    so hate-speech / banned-topic checks run over what was actually generated.
+        outcome = run_guardrails(GuardrailsRequest(
+            alignment=alignment,
+            topic=capped,               # check the generated content, not just the input topic
+            desired_length_words=desired_length_words,
+        ))
+
+        if not outcome.passed:
+            span.set_attribute("output.validation_passed", False)
+            span.set_attribute("output.blocked_reason", outcome.reason or "")
+            return FinalOutput(
+                speech="",
+                word_count=0,
+                truncated=truncated,
+                validation_passed=False,
+                blocked_reason=f"Post-generation filter: {outcome.reason}",
+            )
+
+        span.set_attribute("output.validation_passed", True)
         return FinalOutput(
-            speech="",
-            word_count=0,
+            speech=capped,
+            word_count=len(capped.split()),
             truncated=truncated,
-            validation_passed=False,
-            blocked_reason=f"Post-generation filter: {outcome.reason}",
+            validation_passed=True,
         )
-
-    return FinalOutput(
-        speech=capped,
-        word_count=len(capped.split()),
-        truncated=truncated,
-        validation_passed=True,
-    )
 
 
 # ---------------------------------------------------------------------------

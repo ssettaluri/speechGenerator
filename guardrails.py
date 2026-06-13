@@ -154,22 +154,32 @@ def run_guardrails(request: GuardrailsRequest) -> FilterOutcome:
     Run all guardrail checks against the incoming request.
     Returns the first blocking outcome, or PASS if all checks clear.
     """
-    combined_text = f"{request.alignment} {request.topic}"
+    from telemetry import tracer
+    with tracer.start_as_current_span("guardrails.check") as span:
+        span.set_attribute("guardrails.alignment", request.alignment)
+        span.set_attribute("guardrails.topic", request.topic[:100])
+        span.set_attribute("guardrails.desired_length_words", request.desired_length_words)
 
-    checks = [
-        _check_alignment(request.alignment),
-        _check_length_param(request.desired_length_words),
-        _check_topic_length(request.topic),
-        _check_hate_speech(combined_text),
-        _check_banned_topics(combined_text),
-        _check_prompt_injection(combined_text),
-    ]
+        combined_text = f"{request.alignment} {request.topic}"
 
-    for outcome in checks:
-        if not outcome.passed:
-            return outcome
+        checks = [
+            _check_alignment(request.alignment),
+            _check_length_param(request.desired_length_words),
+            _check_topic_length(request.topic),
+            _check_hate_speech(combined_text),
+            _check_banned_topics(combined_text),
+            _check_prompt_injection(combined_text),
+        ]
 
-    return FilterOutcome(result=FilterResult.PASS)
+        for outcome in checks:
+            if not outcome.passed:
+                span.set_attribute("guardrails.result", "block")
+                span.set_attribute("guardrails.triggered_rule", outcome.triggered_rule or "")
+                span.set_attribute("guardrails.reason", outcome.reason or "")
+                return outcome
+
+        span.set_attribute("guardrails.result", "pass")
+        return FilterOutcome(result=FilterResult.PASS)
 
 
 # ---------------------------------------------------------------------------

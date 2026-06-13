@@ -8,8 +8,11 @@ services:
     ports:
       - "8000:8000"
     environment:
-      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}   # passed in from host env or .env file
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
       - DB_PATH=/data/corpus.db
+      - OTEL_SERVICE_NAME=speech-generator
+      - OTEL_ENVIRONMENT=${ENVIRONMENT:-production}
+      - OTEL_EXPORTER_OTLP_ENDPOINT=${OTEL_EXPORTER_OTLP_ENDPOINT:-}
     volumes:
       - corpus_data:/data                         # persists SQLite DB across restarts
     restart: unless-stopped

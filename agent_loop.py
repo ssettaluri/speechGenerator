@@ -21,6 +21,16 @@ from guardrails import GuardrailsRequest, run_guardrails
 from observability import ObservabilityReport, build_report
 from output import FinalOutput, finalize_output
 from policy_corpus import init_db, query_speeches, seed_db
+from telemetry import (
+    blocked_counter,
+    confidence_histogram,
+    corpus_query_counter,
+    iteration_histogram,
+    latency_histogram,
+    run_counter,
+    token_counter,
+    tracer,
+)
 
 # ---------------------------------------------------------------------------
 # Config
@@ -259,7 +269,17 @@ def _run_one_iteration(
 
 def run_agent_loop(request: LoopRequest) -> LoopResult:
     run_id = str(uuid.uuid4())[:8]
+    labels = {"alignment": request.alignment}
 
+    with tracer.start_as_current_span("harness.run") as root_span:
+      root_span.set_attribute("run.id", run_id)
+      root_span.set_attribute("run.alignment", request.alignment)
+      root_span.set_attribute("run.topic", request.topic)
+      root_span.set_attribute("run.desired_length_words", request.desired_length_words)
+      return _run_agent_loop_inner(request, run_id, labels)
+
+
+def _run_agent_loop_inner(request: LoopRequest, run_id: str, labels: dict) -> LoopResult:
     # ── Step 2: Guardrails ──────────────────────────────────────────────────
     outcome = run_guardrails(GuardrailsRequest(
         alignment=request.alignment,
@@ -267,6 +287,8 @@ def run_agent_loop(request: LoopRequest) -> LoopResult:
         desired_length_words=request.desired_length_words,
     ))
     if not outcome.passed:
+        run_counter.add(1, {**labels, "result": "blocked"})
+        blocked_counter.add(1, {**labels, "rule": outcome.triggered_rule or "unknown"})
         report = build_report(
             run_id=run_id,
             alignment=request.alignment,
@@ -305,40 +327,62 @@ def run_agent_loop(request: LoopRequest) -> LoopResult:
             request.topic, request.desired_length_words, speech or None, iteration
         )
 
-        speech, token_usage, latency_ms, tool_calls, corpus_ids = _run_one_iteration(
-            client, system_prompt, user_prompt, iteration
-        )
-        all_corpus_ids.extend(corpus_ids)
-        confidence = _estimate_confidence(speech, request.desired_length_words)
+        with tracer.start_as_current_span(f"harness.iteration.{iteration}") as iter_span:
+            iter_span.set_attribute("iteration.number", iteration)
 
-        records.append(IterationRecord(
-            iteration=iteration,
-            speech_segment=speech,
-            confidence=confidence,
-            token_usage=token_usage,
-            latency_ms=round(latency_ms, 1),
-            tool_calls=tool_calls,
-        ))
+            speech, token_usage, latency_ms, tool_calls, corpus_ids = _run_one_iteration(
+                client, system_prompt, user_prompt, iteration
+            )
+            all_corpus_ids.extend(corpus_ids)
+            confidence = _estimate_confidence(speech, request.desired_length_words)
 
-        print(
-            f"[iter {iteration}/{MAX_ITERATIONS}] "
-            f"words={len(speech.split())} "
-            f"confidence={confidence:.2f} "
-            f"corpus_queries={len(tool_calls)} "
-            f"tokens=({token_usage['input']}in/{token_usage['output']}out) "
-            f"latency={latency_ms:.0f}ms"
-        )
+            # trace attributes
+            iter_span.set_attribute("iteration.word_count", len(speech.split()))
+            iter_span.set_attribute("iteration.confidence", confidence)
+            iter_span.set_attribute("iteration.input_tokens", token_usage["input"])
+            iter_span.set_attribute("iteration.output_tokens", token_usage["output"])
+            iter_span.set_attribute("iteration.latency_ms", latency_ms)
+            iter_span.set_attribute("iteration.corpus_queries", len(tool_calls))
 
-        # ── Step 6: Exit condition ──────────────────────────────────────────
-        word_count = len(speech.split())
-        length_met = abs(word_count - request.desired_length_words) / request.desired_length_words < 0.10
-        if length_met and confidence >= CONFIDENCE_THRESHOLD:
-            print(f"[loop] Exit: confidence {confidence:.2f} >= {CONFIDENCE_THRESHOLD} and length met.")
-            break
+            # metrics
+            token_counter.add(token_usage["input"] + token_usage["output"], labels)
+            corpus_query_counter.add(len(tool_calls), labels)
+
+            records.append(IterationRecord(
+                iteration=iteration,
+                speech_segment=speech,
+                confidence=confidence,
+                token_usage=token_usage,
+                latency_ms=round(latency_ms, 1),
+                tool_calls=tool_calls,
+            ))
+
+            print(
+                f"[iter {iteration}/{MAX_ITERATIONS}] "
+                f"words={len(speech.split())} "
+                f"confidence={confidence:.2f} "
+                f"corpus_queries={len(tool_calls)} "
+                f"tokens=({token_usage['input']}in/{token_usage['output']}out) "
+                f"latency={latency_ms:.0f}ms"
+            )
+
+            # ── Step 6: Exit condition ──────────────────────────────────────
+            word_count = len(speech.split())
+            length_met = abs(word_count - request.desired_length_words) / request.desired_length_words < 0.10
+            if length_met and confidence >= CONFIDENCE_THRESHOLD:
+                print(f"[loop] Exit: confidence {confidence:.2f} >= {CONFIDENCE_THRESHOLD} and length met.")
+                break
     else:
         print(f"[loop] Exit: max iterations ({MAX_ITERATIONS}) reached.")
 
     deduped_corpus_ids = list(dict.fromkeys(all_corpus_ids))
+
+    # ── End-of-run metrics ───────────────────────────────────────────────────
+    total_latency = sum(r.latency_ms for r in records)
+    run_counter.add(1, {**labels, "result": "success"})
+    iteration_histogram.record(len(records), labels)
+    latency_histogram.record(total_latency, labels)
+    confidence_histogram.record(confidence, labels)
 
     # ── Step 7: Final output — validate, align, length-cap ──────────────────
     final = finalize_output(

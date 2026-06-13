@@ -109,6 +109,7 @@ def query_speeches(
     alignment: Optional[str] = None,
     sentiment: Optional[str] = None,
     limit: int = 5,
+    _traced: bool = True,
 ) -> list[Speech]:
     """
     Retrieve speeches filtered by topic (substring), alignment, and/or sentiment.
@@ -129,9 +130,18 @@ def query_speeches(
     sql = f"SELECT * FROM speeches {where} ORDER BY id DESC LIMIT ?"
     params.append(limit)
 
-    with _conn() as con:
-        rows = con.execute(sql, params).fetchall()
-    return [_row_to_speech(r) for r in rows]
+    from telemetry import tracer
+    with tracer.start_as_current_span("corpus.query") as span:
+        span.set_attribute("corpus.topic", topic or "")
+        span.set_attribute("corpus.alignment", alignment or "")
+        span.set_attribute("corpus.sentiment", sentiment or "")
+        span.set_attribute("corpus.limit", limit)
+        with _conn() as con:
+            rows = con.execute(sql, params).fetchall()
+        results = [_row_to_speech(r) for r in rows]
+        span.set_attribute("corpus.results_count", len(results))
+        span.set_attribute("corpus.result_ids", str([r.id for r in results]))
+        return results
 
 
 def get_speech(speech_id: int) -> Optional[Speech]:
