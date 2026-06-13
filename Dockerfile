@@ -16,18 +16,8 @@ WORKDIR /app
 # Copy installed packages from builder
 COPY --from=builder /install /usr/local
 
-# Copy application source
-COPY guardrails.py \
-     policy_corpus.py \
-     observability.py \
-     output.py \
-     agent_loop.py \
-     api.py \
-     telemetry.py \
-     otel_exporter.py \
-     console.py \
-     logger.py \
-     ./
+# Copy all application source — any new .py file is picked up automatically
+COPY *.py ./
 
 # SQLite corpus DB lives on a mounted volume so data persists across restarts.
 # The volume is mounted at /data; point DB_PATH there via env var.
