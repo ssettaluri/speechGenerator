@@ -23,12 +23,17 @@ COPY guardrails.py \
      output.py \
      agent_loop.py \
      api.py \
+     telemetry.py \
+     otel_exporter.py \
+     console.py \
+     logger.py \
      ./
 
 # SQLite corpus DB lives on a mounted volume so data persists across restarts.
 # The volume is mounted at /data; point DB_PATH there via env var.
 ENV DB_PATH=/data/corpus.db
 ENV PYTHONUNBUFFERED=1
+ENV PYTHONPATH=/app
 
 # Create the data directory (overridden by volume mount at runtime)
 RUN mkdir /data
